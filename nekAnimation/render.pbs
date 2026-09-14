@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+#PBS -A AdvanceFusionFission
+#PBS -q prod
+#PBS -l select=1
+#PBS -l walltime=02:00:00
+#PBS -l filesystems=home:flare
+#PBS -l place=scatter
+#PBS -N nek_render
+#PBS -j oe
+#
+# Render nek field files to frames on Aurora with MPI pvbatch.
+#
+# Everything is driven by environment variables so one script covers every
+# run. Pass them with qsub -v (comma separated, quote values with spaces):
+#
+#   qsub -v SCENE=scene.pvsm,DATA=/lus/flare/projects/P/run,OUT=/lus/flare/projects/P/frames render.pbs
+#
+# Knobs (defaults in brackets):
+#   SCENE      .pvsm state file saved from the ParaView GUI        [scene.pvsm]
+#   DATA       directory holding <case>0.f***** files             [data]
+#   OUT        frame directory                                     [frames]
+#   RPN        MPI ranks per node                                  [12]
+#   PART       K/N: render only chunk K of N, for splitting a movie across jobs
+#   NPARTS     N for a job array: `qsub -J 1-N -v ...,NPARTS=N render.pbs`
+#              sets PART=$PBS_ARRAY_INDEX/N in each sub-job
+#   EXTRA      anything else for nek_render.py, e.g. "--stride 2 --end 100"
+#
+# ParaView comes from one of two places, pick with:
+#   PV_MODULE  name from `module use /soft/modulefiles; module avail paraview`
+#              -- multi-node capable, uses Aurora's MPI            [paraview]
+#   PV_HOME    root of a Kitware binary tarball unpacked in $HOME, e.g.
+#              $HOME/opt/ParaView-6.0.0-MPI-Linux-Python3.12-x86_64.
+#              Uses the tarball's own mpiexec, so single node only. Use this
+#              when no module matches the GUI version the scene was saved with.
+#
+# Override the PBS directives above on the command line as needed, e.g.
+#   qsub -q debug -l walltime=00:30:00 -l select=2 -v ... render.pbs
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+SCENE="${SCENE:-scene.pvsm}"
+DATA="${DATA:-data}"
+OUT="${OUT:-frames}"
+RPN="${RPN:-12}"
+PART="${PART:-}"
+NPARTS="${NPARTS:-}"
+EXTRA="${EXTRA:-}"
+
+if [[ -n "$NPARTS" ]]; then
+    if [[ -z "${PBS_ARRAY_INDEX:-}" ]]; then
+        echo "error: NPARTS=$NPARTS needs a job array (qsub -J 1-$NPARTS)" >&2
+        exit 2
+    fi
+    PART="$PBS_ARRAY_INDEX/$NPARTS"
+fi
+PV_MODULE="${PV_MODULE:-paraview}"
+PV_HOME="${PV_HOME:-}"
+
+NNODES=$(wc -l < "$PBS_NODEFILE")
+
+# shellcheck disable=SC2206  # EXTRA is meant to be word-split
+ARGS=(nek_render.py "$SCENE" --data "$DATA" --out "$OUT" ${PART:+--part "$PART"} $EXTRA)
+
+echo "job $PBS_JOBID: $NNODES node(s) x $RPN rank(s), scene $SCENE, data $DATA -> $OUT"
+
+if [[ -n "$PV_HOME" ]]; then
+    if (( NNODES > 1 )); then
+        echo "warning: PV_HOME runs on a single node; ignoring the other $((NNODES - 1))" >&2
+    fi
+    echo "using $PV_HOME"
+    "$PV_HOME/bin/mpiexec" -n "$RPN" \
+        "$PV_HOME/bin/pvbatch" --force-offscreen-rendering "${ARGS[@]}"
+else
+    module use /soft/modulefiles
+    module load "$PV_MODULE"
+    echo "using module $PV_MODULE: $(command -v pvbatch)"
+    mpiexec -n $((NNODES * RPN)) --ppn "$RPN" \
+        pvbatch --force-offscreen-rendering "${ARGS[@]}"
+fi
