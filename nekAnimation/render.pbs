@@ -24,6 +24,12 @@
 #   NPARTS     N for a job array: `qsub -J 1-N -v ...,NPARTS=N render.pbs`
 #              sets PART=$PBS_ARRAY_INDEX/N in each sub-job
 #   EXTRA      anything else for nek_render.py, e.g. "--stride 2 --end 100"
+#   BACKEND    ParaView --opengl-window-backend value                [OSMesa]
+#              Aurora's GPUs have no OpenGL driver and the automatic choice
+#              (X, then EGL) ends on an unusable GL 3.1 context, so rendering
+#              is forced onto the CPU. Set to EGL on a machine with real GPUs.
+#   LP_NUM_THREADS  threads per rank for Mesa's llvmpipe rasterizer  [8]
+#              (its default is every core, times RPN ranks on the node)
 #
 # ParaView comes from one of two places, pick with:
 #   PV_MODULE  name from `module use /soft/modulefiles; module avail paraview`
@@ -47,6 +53,8 @@ RPN="${RPN:-12}"
 PART="${PART:-}"
 NPARTS="${NPARTS:-}"
 EXTRA="${EXTRA:-}"
+BACKEND="${BACKEND:-OSMesa}"
+export LP_NUM_THREADS="${LP_NUM_THREADS:-8}"
 
 if [[ -n "$NPARTS" ]]; then
     if [[ -z "${PBS_ARRAY_INDEX:-}" ]]; then
@@ -61,9 +69,11 @@ PV_HOME="${PV_HOME:-}"
 NNODES=$(wc -l < "$PBS_NODEFILE")
 
 # shellcheck disable=SC2206  # EXTRA is meant to be word-split
-ARGS=(nek_render.py "$SCENE" --data "$DATA" --out "$OUT" ${PART:+--part "$PART"} $EXTRA)
+# ParaView's own options go before the script name.
+ARGS=(--force-offscreen-rendering --opengl-window-backend "$BACKEND"
+      nek_render.py "$SCENE" --data "$DATA" --out "$OUT" ${PART:+--part "$PART"} $EXTRA)
 
-echo "job $PBS_JOBID: $NNODES node(s) x $RPN rank(s), scene $SCENE, data $DATA -> $OUT"
+echo "job $PBS_JOBID: $NNODES node(s) x $RPN rank(s), backend $BACKEND, scene $SCENE, data $DATA -> $OUT"
 
 if [[ -n "$PV_HOME" ]]; then
     if (( NNODES > 1 )); then
@@ -71,11 +81,11 @@ if [[ -n "$PV_HOME" ]]; then
     fi
     echo "using $PV_HOME"
     "$PV_HOME/bin/mpiexec" -n "$RPN" \
-        "$PV_HOME/bin/pvbatch" --force-offscreen-rendering "${ARGS[@]}"
+        "$PV_HOME/bin/pvbatch" "${ARGS[@]}"
 else
     module use /soft/modulefiles
     module load "$PV_MODULE"
     echo "using module $PV_MODULE: $(command -v pvbatch)"
     mpiexec -n $((NNODES * RPN)) --ppn "$RPN" \
-        pvbatch --force-offscreen-rendering "${ARGS[@]}"
+        pvbatch "${ARGS[@]}"
 fi

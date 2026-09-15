@@ -20,10 +20,10 @@ set -euo pipefail
 REMOTE_HOST="aws@aurora.alcf.anl.gov"
 
 # Directory on the remote host that holds the file.
-REMOTE_DIR="/lus/flare/projects/AdvanceFusionFission/aws/varyRe"
+REMOTE_DIR="/lus/flare/projects/AdvanceFusionFission/aws/varyRe/logs"
 
 # File to grab out of REMOTE_DIR.
-REMOTE_FILE="nekRS_baf.o8800340"
+REMOTE_FILE="log*"
 
 # Where to drop the file locally.
 LOCAL_DIR="./data"

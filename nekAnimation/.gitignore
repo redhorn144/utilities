@@ -3,3 +3,6 @@ data/*
 frames/
 *.mp4
 __pycache__/
+logfile
+*.pvsm
+figures/

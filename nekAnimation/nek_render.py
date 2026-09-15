@@ -52,6 +52,14 @@ from pathlib import Path
 NEK_READER_TYPES = ("Nek5000Reader", "VisItNek5000Reader")
 SERIAL_READER_TYPES = ("VisItNek5000Reader",)
 
+# vtkNek5000Reader matches its PointArrayStatus entries to the file's variables
+# by position, not by name, and its variables are in header order (U P T S).
+# A state saved from the GUI lists the arrays alphabetically, so pushing it
+# as-is enables the wrong variables. Entries are re-sorted into this order
+# before the state is loaded; anything unknown goes last.
+NEK_ARRAY_ORDER = {"Velocity": 0, "Velocity Magnitude": 1, "Pressure": 2, "Temperature": 3}
+NEK_SCALAR_ARRAY = re.compile(r"^S(\d+)$")
+
 # nek field file names: <case><fileid>.f<step>, e.g. turbPipe0.f00012.
 FIELD_FILE = re.compile(r"^(?P<case>.+?)(?P<fileid>\d)\.f(?P<step>\d{5})$")
 
@@ -163,6 +171,58 @@ def find_nek_readers(pvsm):
     return readers
 
 
+def nek_array_rank(name):
+    if name in NEK_ARRAY_ORDER:
+        return NEK_ARRAY_ORDER[name]
+    m = NEK_SCALAR_ARRAY.match(name)
+    return 4 + int(m.group(1)) if m else 1000
+
+
+def patch_state(pvsm, patched):
+    """Write a copy of the state whose native readers survive being loaded.
+
+    Two vtkNek5000Reader quirks are worked around: the array selection is put
+    in the reader's own order (see NEK_ARRAY_ORDER), and 'Velocity' is enabled
+    whenever the derived 'Velocity Magnitude' is, because the reader only
+    computes the magnitude while reading the velocity (on its own it fills the
+    array with misaligned velocity components). Returns the path to load: the
+    original when nothing needed changing.
+    """
+    tree = ET.parse(pvsm)
+    changed = False
+    for proxy in tree.getroot().iter("Proxy"):
+        if proxy.get("group") != "sources" or proxy.get("type") != "Nek5000Reader":
+            continue
+        prop = next((p for p in proxy.iter("Property")
+                     if p.get("name") == "PointArrayStatus"), None)
+        if prop is None:
+            continue
+        elems = [e for e in prop if e.tag == "Element"]
+        pairs = [(elems[i].get("value"), elems[i + 1].get("value"))
+                 for i in range(0, len(elems) - 1, 2)]
+        status = dict(pairs)
+        if status.get("Velocity Magnitude") == "1" and status.get("Velocity") == "0":
+            warn("warning: 'Velocity Magnitude' needs 'Velocity'; enabling it in the reader")
+            status["Velocity"] = "1"
+        wanted = [(n, status[n]) for n in sorted(status, key=nek_array_rank)]
+        if wanted == pairs:
+            continue
+        at = list(prop).index(elems[0])
+        for e in elems:
+            prop.remove(e)
+        for i, (name, value) in enumerate(wanted):
+            for j, v in ((2 * i, name), (2 * i + 1, value)):
+                e = ET.Element("Element", index=str(j), value=v)
+                e.tail = elems[0].tail  # keep the indentation readable
+                prop.insert(at + j, e)
+        changed = True
+    if not changed:
+        return pvsm
+    tree.write(patched)
+    log(f"reader array selection reordered for loading -> {patched}")
+    return patched
+
+
 # ----------------------------------------------------------------- rendering --
 
 
@@ -180,6 +240,27 @@ def take_part(items, part):
         sys.exit(f"error: --part {part}: need 1 <= K <= N")
     per = -(-len(items) // n)  # ceil
     return items[(k - 1) * per : k * per]
+
+
+def check_arrays(pv, readers, t):
+    """Die if a reader does not produce every array its selection enables.
+
+    A representation colored by a missing array silently falls back to solid
+    white, which is much harder to notice in a batch of frames than an error.
+    """
+    for _, name, _ in readers:
+        reader = pv.FindSource(name)
+        if reader is None or not hasattr(reader, "PointArrayStatus"):
+            continue
+        reader.UpdatePipeline(t)
+        present = list(reader.PointData.keys())
+        log(f"reader '{name}' point arrays: {', '.join(present) or 'none'}")
+        missing = [n for n in reader.PointArrayStatus if n not in present]
+        if missing:
+            sys.exit(
+                f"error: reader '{name}' did not produce {', '.join(missing)}; "
+                "check the reader's array selection in the scene"
+            )
 
 
 def render(pvsm, nek5000, readers, frames, resolution, use_layout):
@@ -212,6 +293,8 @@ def render(pvsm, nek5000, readers, frames, resolution, use_layout):
     scene = pv.GetAnimationScene()
     scene.UpdateAnimationUsingDataTimeSteps()
     times = list(pv.GetTimeKeeper().TimestepValues)
+    if times:
+        check_arrays(pv, readers, times[0])
 
     view = pv.GetActiveView()
     if view is None:
@@ -313,6 +396,9 @@ def main(argv=None):
 
     out_dir = args.out.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    scene = args.scene
+    if scene is not None:
+        scene = patch_state(scene, out_dir / f"{scene.stem}.loaded.pvsm")
 
     indices = range(count)[args.start:args.end:args.stride]
     frames = [(first + i, frame_path(out_dir, case, first + i), i) for i in indices]
@@ -332,7 +418,7 @@ def main(argv=None):
         for step, path, _ in frames:
             log(f"  step {step} -> {path}")
     elif frames:
-        render(args.scene, nek5000, readers, frames, args.resolution, args.layout)
+        render(scene, nek5000, readers, frames, args.resolution, args.layout)
 
     log("\nstitch with:\n  " + ffmpeg_hint(args.out, case))
 
